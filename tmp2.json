@@ -1,0 +1,60 @@
+﻿{
+    "name":  "warung",
+    "version":  "0.1.0",
+    "private":  true,
+    "description":  "Aplikasi Web Warung â€” PWA POS + e-commerce + credit management untuk warung/toko kelontong",
+    "license":  "MIT",
+    "engines":  {
+                    "node":  "\u003e=20.11.0",
+                    "pnpm":  "\u003e=9.0.0"
+                },
+    "packageManager":  "pnpm@9.15.0",
+    "scripts":  {
+                    "build":  "turbo run build",
+                    "dev":  "turbo run dev",
+                    "lint":  "turbo run lint",
+                    "lint:fix":  "turbo run lint -- --fix",
+                    "typecheck":  "turbo run typecheck",
+                    "test":  "turbo run test",
+                    "test:coverage":  "turbo run test -- --coverage",
+                    "test:e2e":  "turbo run test:e2e",
+                    "format":  "prettier --write \"**/*.{ts,tsx,js,mjs,cjs,json,md,yml,yaml,prisma}\"",
+                    "format:check":  "prettier --check \"**/*.{ts,tsx,js,mjs,cjs,json,md,yml,yaml,prisma}\"",
+                    "clean":  "turbo run clean \u0026\u0026 rm -rf node_modules",
+                    "db:generate":  "pnpm --filter @warung/api db:generate",
+                    "db:migrate":  "pnpm --filter @warung/api db:migrate",
+                    "db:deploy":  "pnpm --filter @warung/api db:deploy",
+                    "db:seed":  "pnpm --filter @warung/api db:seed",
+                    "db:studio":  "pnpm --filter @warung/api db:studio",
+                    "db:reset":  "pnpm --filter @warung/api db:reset",
+                    "verify":  "pnpm format:check \u0026\u0026 pnpm lint \u0026\u0026 pnpm typecheck \u0026\u0026 pnpm test",
+                    "prepare":  "husky || true",
+                    "test:offline":  "node --experimental-transform-types --no-warnings scripts/offline/run.mjs"
+                },
+    "devDependencies":  {
+                            "@commitlint/cli":  "^19.6.1",
+                            "@commitlint/config-conventional":  "^19.6.0",
+                            "@eslint/js":  "^9.17.0",
+                                                        "@types/node":  "^22.10.2",
+                            "eslint":  "^9.17.0",
+                            "eslint-config-prettier":  "^9.1.0",
+                            "eslint-plugin-simple-import-sort":  "^12.1.1",
+                            "globals":  "^15.14.0",
+                            "husky":  "^9.1.7",
+                            "lint-staged":  "^15.2.11",
+                            "prettier":  "^3.4.2",
+                            "prettier-plugin-prisma": "^5.0.0",
+                            "turbo":  "^2.3.3",
+                            "typescript":  "^5.7.2",
+                            "typescript-eslint":  "^8.18.1"
+                        },
+    "lint-staged":  {
+                        "*.{ts,tsx}":  [
+                                           "eslint --fix --max-warnings=0",
+                                           "prettier --write"
+                                       ],
+                        "*.{json,md,yml,yaml,prisma}":  [
+                                                            "prettier --write"
+                                                        ]
+                    }
+}

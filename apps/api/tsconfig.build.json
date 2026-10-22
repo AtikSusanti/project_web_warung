@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": true,
+    "outDir": "./dist",
+    "removeComments": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "test", "**/*.spec.ts", "**/*.test.ts", "prisma/seed.ts"]
+}

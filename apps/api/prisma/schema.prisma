@@ -1,0 +1,917 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// APLIKASI WEB WARUNG — Prisma Schema
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Dokumen ini adalah keputusan desain, bukan sekadar definisi tabel. Setiap
+// pilihan yang menyimpang dari blueprint v1.0 dijelaskan di sini dan dirinci
+// lengkap di docs/adr/.
+//
+// RINGKASAN DEVIASI DARI BLUEPRINT
+// ───────────────────────────────
+// 1. TIDAK ADA `tenant_id`. Blueprint §2.3/§3.5 menjanjikan multi-tenant dengan
+//    RLS, tapi ERD-nya nol `tenant_id`. Versi pertama = satu warung, satu deploy.
+//    Lihat ADR-0002.
+// 2. Semua uang `Decimal @db.Decimal(14,2)`, TIDAK `Float`/`Int`. Integer sen
+//    dipakai di level aplikasi; kolom ini decency untuk query & agregasi SQL.
+//    Lihat ADR-0003.
+// 3. `transaction_payments` sebagai tabel terpisah, bukan enum tunggal pada
+//    `transactions`. Blueprint §5.4 meminta "multiple payment method" yang
+//    tidak bisa dimodelkan satu kolom enum.
+// 4. `orders.items` TIDAK JSONB. Diganti `order_items` ternormalisasi dengan
+//    snapshot harga. Blueprint ERD memakai JSONB, yang tidak punya integritas
+//    referensi dan membuat "produk terlaris" mustahil dihitung.
+// 5. `debt_payments` + `payment_allocations`, sehingga satu pembayaran dapat
+//    melunasi beberapa invoice (FIFO) dan satu invoice dapat menerima beberapa
+//    pembayaran. Blueprint hanya memodelkan 1:1.
+// 6. `idempotency_keys` untuk replay offline POS.
+// 7. `document_sequences` untuk nomor dokumen yang aman terhadap konkurensi.
+// 8. `refresh_tokens` dengan rotasi + deteksi reuse agar logout benar-benar
+//    mengakhiri sesi (JWT stateless tidak bisa achieve ini sendiri).
+// 9. `stock_movements` adalah ledger append-only; `products.stock_qty` hanyalah
+//    cache yang selalu ditulis bersamaan dalam satu transaksi DB.
+// 10. TIDAK ADA tabel `accounts` / `journals` / `journal_lines` / `fiscal_periods`
+//     / `inventory_cost_layers` di versi ini. Phase 3. Sifat kebutuhannya sudah
+//     diDokumentasikan di ADR-0004 dan ADR-0005 supaya tidak perlu merombak
+//     skema yang sudah jalan.
+//
+// YANG TIDAK BOLEH DILAKUKAN
+// ─────────────────────────
+// - `db push` untuk produksi. Selalu `migrate dev` lalu commit folder migrations.
+// - Menambah kolom uang dengan tipe Float.
+// - Menghapus baris di `transactions`, `transaction_items`, `stock_movements`,
+//   `payment_allocations`, atau `audit_logs`. itu append-only. Pembatalan
+//   dilakukan lewat `voided_at` atau jurnal pembalik, bukan DELETE.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["relationJoins", "fullTextSearchPostgres"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // Prisma membungkus error unik menjadi PrismaKnownRequestError P2002 dengan
+  // `target`. Aplikasi TIDAK boleh membuat exception generik sebagaiallyResponse:
+  // akibatnya, database yang tidak bisapon diawasi karena exception-nya ditelan
+  // filter HTTP. Lihat apps/api/src/common/filters/prisma-exception.filter.ts.
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENUM
+// Nilai string WAJIB sama dengan konstanta di packages/shared/src/enums.ts.
+// Ada test yang memverifikasi ini: packages/shared/src/enums.contract.test.ts
+// ═══════════════════════════════════════════════════════════════════════════════
+
+enum UserRole {
+  ADMIN
+  CASHIER
+}
+
+enum PaymentMethod {
+  CASH
+  TRANSFER
+  QRIS
+  DEBT
+}
+
+enum PaymentStatus {
+  PAID
+  UNPAID
+  PARTIAL
+  WRITTEN_OFF
+}
+
+enum TransactionStatus {
+  COMPLETED
+  VOIDED
+}
+
+enum OrderStatus {
+  PENDING_WA
+  WA_SENT
+  CONFIRMED
+  CONVERTED
+  CANCELLED
+}
+
+enum StockMovementType {
+  PURCHASE
+  SALE
+  RETURN
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  OPNAME
+  DAMAGE
+  EXPIRED
+}
+
+enum UnitOfMeasure {
+  PCS
+  PACK
+  KG
+  GRAM
+  LITER
+  ML
+  BOX
+  DOSE
+  RID
+}
+
+enum CustomerStatus {
+  ACTIVE
+  BLOCKED
+}
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+enum CategoryColor {
+  DEFAULT
+  RED
+  ORANGE
+  AMBER
+  GREEN
+  TEAL
+  BLUE
+  INDIGO
+  PURPLE
+  PINK
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  LOGIN
+  LOGIN_FAILED
+  LOGOUT
+  REFRESH
+  VOID
+  STOCK_ADJUST
+  STOCK_OPNAME
+  DEBT_PAYMENT
+  DEBT_WRITEOFF
+  ORDER_STATUS
+  EXPORT
+  BULK_IMPORT
+}
+
+enum StockReferenceType {
+  TRANSACTION
+  ORDER
+  OPNAME
+  MANUAL
+  PURCHASE
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PENGGUNA & AUTENTIKASI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  username     String   @unique @db.VarChar(32)
+  fullName     String   @db.VarChar(120)
+  // scrypt (node:crypto), format: scrypt$N$r$p$salt$hash. Tidak ada dependensi
+  // native sehingga build di Docker/Windows tidak perlu toolchain. Lihat
+  // apps/api/src/modules/auth/password.service.ts
+  passwordHash String   @db.VarChar(255)
+  phone        String?  @db.VarChar(20)
+  role         UserRole @default(CASHIER)
+  isActive     Boolean  @default(true)
+
+  /// Rotasi password memaksa semua sesi lain ikut logout.
+  passwordChangedAt DateTime?
+  lastLoginAt       DateTime?
+
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  // Relasi
+  transactions         Transaction[]
+  shiftsOpened         Shift[]         @relation("ShiftOpenedBy")
+  shiftsClosed         Shift[]         @relation("ShiftClosedBy")
+  stockMovements       StockMovement[]
+  auditLogs            AuditLog[]
+  refreshTokens        RefreshToken[]
+  debtPaymentsReceived DebtPayment[]   @relation("DebtReceivedBy")
+  debtWriteOffs        DebtWriteOff[]  @relation("WriteOffBy")
+
+  @@index([role, isActive])
+  @@map("users")
+}
+
+/// Refresh token dengan rotasi dan deteksi reuse.
+///
+/// Kenapa tabel ini wajib: JWT access token bersifat stateless, jadi "logout"
+/// secara definisi tidak bisa mencabut token yang sudah diberikan. Yang bisa
+/// dilakukan adalah mencabut refresh token. Dengan rotasi, bila sebuah refresh
+/// token yang sudah dipakai ulang kembali dikembalikan, seluruh keluarga token
+/// dicabut — ini yang mendeteksi pencurian token.
+///
+/// Hanya hash token yang disimpan. Kalau database bocor, token yang tercuri
+/// tidak langsung bisa dipakai.
+model RefreshToken {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+
+  /// SHA-256 dari token. Token mentah hanya ada di memory dan cookie.
+  tokenHash String @unique @db.VarChar(64)
+
+  /// ID akar keluarga token. Semua token hasil rotasi berbagi familyId.
+  /// Revoking satu keluarga = logout di semua perangkat.
+  familyId String @db.Uuid
+
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  revokedReason String?   @db.VarChar(64)
+
+  /// Deteksi reuse: token yang sudah dirotasi akan datang lagi saat dicoba.
+  usedAt DateTime?
+
+  userAgent String? @db.VarChar(255)
+  ipAddress String? @db.VarChar(45)
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PENGATURAN — single row
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Baris tunggal. `id` di-check = 1 oleh CHECK constraint di SQL migration
+/// supaya tidak mungkin ada pengaturan kedua diam-diam.
+model Setting {
+  id            Int     @id @default(1)
+  storeName     String  @db.VarChar(120)
+  storeTagline  String? @db.VarChar(160)
+  waPhoneNumber String  @db.VarChar(20)
+  address       String? @db.VarChar(500)
+
+  /// Persentase dalam basis point (11% = 1100).
+  taxBps       Int     @default(1100)
+  /// true = harga jual sudah termasuk PPN. Ini asumsi yang paling Affects
+  /// keseluruhan laporan keuangan, jadi KONFIGURASI wajib, bukan kode.
+  taxInclusive Boolean @default(true)
+  taxLabel     String  @default("PPN") @db.VarChar(32)
+
+  enableCashRounding  Boolean @default(false)
+  /// Kelipatan pecahan dalam SEN. 10.000 = Rp 100.
+  cashRoundingStepSen Int     @default(10000)
+
+  receiptFooter             String? @db.VarChar(500)
+  showWholesaleInCatalog    Boolean @default(false)
+  maxTransactionDiscountBps Int     @default(3000)
+
+  invoicePrefix String @default("INV") @db.VarChar(8)
+  currency      String @default("IDR") @db.Char(3)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KATALOG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Kategori mendukung hierarki lewat `parentId`. Kedalaman maksimum 3 ditegakkan di
+/// service (self-referential parent cycle adalah masalah referensial yang
+/// CHECK constraint SQL tidak bisa tangkap).
+model Category {
+  id          String        @id @default(uuid()) @db.Uuid
+  name        String        @db.VarChar(120)
+  slug        String        @unique @db.VarChar(160)
+  description String?       @db.VarChar(500)
+  parentId    String?       @db.Uuid
+  color       CategoryColor @default(DEFAULT)
+  imageUrl    String?       @db.VarChar(500)
+  sortOrder   Int           @default(0)
+  isActive    Boolean       @default(true)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@index([parentId, sortOrder])
+  @@index([isActive, sortOrder])
+  @@map("categories")
+}
+
+model Product {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Dinormalisasi lowercase + strip (lihat skuSchema di packages/shared).
+  /// Unik. Perbandingan TIDAK case-insensitive karena sudah dinormalisasi
+  /// di boundary aplikasi — sehingga index tetap bisa dipakai.
+  sku         String  @unique @db.VarChar(64)
+  barcode     String? @unique @db.VarChar(13)
+  name        String  @db.VarChar(160)
+  slug        String  @unique @db.VarChar(180)
+  description String? @db.Text
+
+  categoryId String? @db.Uuid
+
+  // ── Uang: Decimal(14,2). Tidak pernah Float. ───────────────────────────────
+  priceBuy       Decimal  @db.Decimal(14, 2)
+  priceSell      Decimal  @db.Decimal(14, 2)
+  priceWholesale Decimal? @db.Decimal(14, 2)
+
+  // ── Stok: CACHE, bukan sumber kebenaran ───────────────────────────────────
+  // Sumber kebenaran adalah StockMovement. Kolom ini hanya dipercepat supaya
+  // katalog tidak perlu join 10.000 baris ledger.
+  // Semua penulisan WAJIB lewat StockService yang melakukan:
+  //   UPDATE products SET stock_qty = stock_qty + $delta
+  //    WHERE id = $id AND stock_qty + $delta >= 0
+  // Dikembalikan 0 baris berarti stok tidak cukup, dan rollback terjadi.
+  stockQty Int @default(0)
+  minStock Int @default(0)
+
+  unit UnitOfMeasure @default(PCS)
+
+  imageUrl        String? @db.VarChar(500)
+  wholesaleMinQty Int?
+
+  isActive   Boolean @default(true)
+  isFeatured Boolean @default(false)
+  isPublic   Boolean @default(true)
+
+  /// Optimistic locking. Transaksi POS yang mengambil harga harus mengirim
+  /// `version`; bila harga berubah di tengah kasir menekan Bayar, request
+  /// ditolak alih-alih menjual dengan harga lama tanpa sepengetahuan kasir.
+  version Int @default(1)
+
+  /// Diisi trigger `products_search_vector_refresh`, bukan oleh aplikasi.
+  /// Dideklarasikan di sini hanya supaya migration engine tidak menghitungnya
+  /// sebagai drift dan mengusulkan DROP COLUMN. Prisma tidak bisa menulis kolom
+  /// bertipe `Unsupported`, jadi jangan pernah mengirimnya di create/update.
+  searchVector Unsupported("tsvector")?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  category         Category?         @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  stockMovements   StockMovement[]
+  transactionItems TransactionItem[]
+  orderItems       OrderItem[]
+
+  /// Pencarian full-text bahasa Indonesia. Idempotent dengan Define, dibuat di
+  /// SQL migration (Prisma tidak mendukung generated tsvector).
+  // @@index([searchVector], type: Gin) -> ditulis manual di migration
+
+  // Filter katalog publik: (is_public, is_active)
+  // Filter POS: (is_active) + pencarian
+  @@index([categoryId, isActive])
+  @@index([isPublic, isActive, isFeatured])
+  @@index([name])
+  @@index([stockQty])
+  @@map("products")
+}
+
+/// Ledger pergerakan stok. APPEND-ONLY: tidak pernah UPDATE atau DELETE.
+///
+/// Setiap perubahan stok punya tepat satu baris di sini. Baris ini yang
+/// menjadi sumber kebenaran untuk kartu stok dan investigasi selisih.
+model StockMovement {
+  id        String @id @default(uuid()) @db.Uuid
+  productId String @db.Uuid
+
+  type StockMovementType
+
+  /// Selalu POSITIF. Arah diturunkan dari `type` lewat DIRECTIONS di
+  /// packages/shared/src/enums.ts, bukan disimpan terpisah supaya tidak
+  /// bisa tidak konsisten.
+  qty Int
+
+  /// Foto stok sebelum dan sesudah. Disimpan untuk delta debugging dan
+  /// supaya kartu stok bisa dihitung tanpa membaca seluruh riwayat.
+  stockBefore Int
+  stockAfter  Int
+
+  refType StockReferenceType?
+  refId   String?             @db.Uuid
+
+  notes String? @db.VarChar(500)
+
+  /// Harga satuan pada saat movement masuk (menjadi modal baris).
+  unitCost Decimal? @db.Decimal(14, 2)
+
+  createdById String?  @db.Uuid
+  createdAt   DateTime @default(now())
+
+  product   Product? @relation(fields: [productId], references: [id], onDelete: Restrict)
+  createdBy User?    @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([productId, createdAt])
+  @@index([createdAt])
+  @@index([refType, refId])
+  @@map("stock_movements")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PELANGGAN & PIUTANG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+model Customer {
+  id      String  @id @default(uuid()) @db.Uuid
+  name    String  @db.VarChar(120)
+  /// Dinormalisasi ke 62xxx oleh phoneSchema. Unik karena satu pelanggan
+  /// tidak boleh terduplikasi akibat ejaan 08xx vs +62xx.
+  phone   String  @unique @db.VarChar(20)
+  address String? @db.VarChar(500)
+
+  /// 0 = tanpa limit kredit.
+  creditLimit Decimal @default(0) @db.Decimal(14, 2)
+
+  /// SALDO TIDAK DISIMPAN DI SINI.
+  ///
+  /// Blueprint ERD punya `customers.balance_due`. Kolom itu akan basi begitu
+  /// ada pembayaran parsial yang menyentuh banyak invoice, dan tidak ada
+  /// mekanisme yang memaksa sinkron. Di sini saldo =
+  /// SUM(transaction.outstanding) - SUM(allocations), dihitung dari
+  /// `transactions.outstanding_amount` yang sudah denormalisasi dan
+  /// diperbarui dalam transaksi DB yang sama. Lihat ADR-0006.
+  status CustomerStatus @default(ACTIVE)
+  note   String?        @db.VarChar(1000)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  transactions Transaction[]
+  debtPayments DebtPayment[]
+  writeOffs    DebtWriteOff[]
+  orders       Order[]
+
+  @@index([status, name])
+  @@index([name])
+  @@map("customers")
+}
+
+model Transaction {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// UNIQUE. Inilah jaminan anti-duikat dari race condition dua kasir.
+  /// Nomor diambil dari document_sequences dengan atomic increment, lalu
+  /// index unik ini yang menangkap bila ada yang tetap bentrok.
+  invoiceNo String @unique @db.VarChar(24)
+
+  status        TransactionStatus @default(COMPLETED)
+  paymentStatus PaymentStatus     @default(PAID)
+
+  cashierId  String  @db.Uuid
+  customerId String? @db.Uuid
+  shiftId    String? @db.Uuid
+
+  // ── Ringkasan hasil calculateCart() ───────────────────────────────────────
+  subtotal                  Decimal @db.Decimal(14, 2)
+  lineDiscountTotal         Decimal @db.Decimal(14, 2)
+  transactionDiscountAmount Decimal @default(0) @db.Decimal(14, 2)
+  discountTotal             Decimal @default(0) @db.Decimal(14, 2)
+  /// Σ nilai bersih baris. Dasar pajak kalau harga eksklusif.
+  taxableBase               Decimal @db.Decimal(14, 2)
+  /// Porsi PPN. Untuk harga inklusif ini hanya untuk pelaporan.
+  taxTotal                  Decimal @default(0) @db.Decimal(14, 2)
+  /// Total SEBELUM pembulatan kas.
+  grandTotal                Decimal @db.Decimal(14, 2)
+  /// Total SETELAH pembulatan kas. Inilah yang dibayar pelanggan.
+  roundedTotal              Decimal @db.Decimal(14, 2)
+  roundingAdjustment        Decimal @default(0) @db.Decimal(14, 2)
+
+  /// Σ seluruh baris transaction_payments.
+  paidTotal         Decimal @default(0) @db.Decimal(14, 2)
+  changeAmount      Decimal @default(0) @db.Decimal(14, 2)
+  /// Sisa yang harus dibayar pelanggan. > 0 hanya bila ada DEBT.
+  /// = roundedTotal - (paidTotal - changeAmount)
+  outstandingAmount Decimal @default(0) @db.Decimal(14, 2)
+
+  transactionDiscountBps Int     @default(0)
+  taxBps                 Int     @default(0)
+  taxInclusive           Boolean @default(true)
+
+  dueDate DateTime?
+  note    String?   @db.VarChar(500)
+
+  /// Tanggal bisnis transaksi, dipisah dari `createdAt` (waktu pencatatan).
+  /// Kasir boleh mengoreksi tanggal transaksi (mis. transaksi dicatat pagi
+  /// untuk penjualan semalam), tanpa mengoreksi jejak audit kapan ia
+  /// dicatat. Penting untuk laporan harian.
+  transactionDate DateTime
+
+  voidedAt   DateTime?
+  voidedById String?   @db.Uuid
+  voidReason String?   @db.VarChar(500)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cashier  User      @relation(fields: [cashierId], references: [id], onDelete: Restrict)
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  shift    Shift?    @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+
+  items          TransactionItem[]
+  payments       TransactionPayment[]
+  allocations    PaymentAllocation[]
+  convertedOrder Order?               @relation("OrderTransaction")
+  debtPayment    DebtPayment?
+
+  // Laporan harian
+  @@index([createdAt])
+  @@index([transactionDate])
+  // Piutang: hanya baris yang belum lunas. Partial index karena tabel
+  // transaksi tumbuh paling cepat di aplikasi ini.
+  @@index([customerId, transactionDate])
+  @@index([paymentStatus, dueDate])
+  @@index([invoiceNo])
+  @@map("transactions")
+}
+
+model TransactionItem {
+  id            String @id @default(uuid()) @db.Uuid
+  transactionId String @db.Uuid
+  productId     String @db.Uuid
+
+  /// Disalin dari master saat transaksi dibuat. Kalau produk di-rename atau
+  /// di-hapus, struk lama tetap terbaca persis seperti yang dilihat kasir.
+  productName String        @db.VarChar(160)
+  sku         String        @db.VarChar(64)
+  unit        UnitOfMeasure
+
+  qty Int
+
+  unitPrice                 Decimal @db.Decimal(14, 2)
+  /// qty x unitPrice
+  grossAmount               Decimal @db.Decimal(14, 2)
+  lineDiscountAmount        Decimal @default(0) @db.Decimal(14, 2)
+  transactionDiscountAmount Decimal @default(0) @db.Decimal(14, 2)
+  discountAmount            Decimal @default(0) @db.Decimal(14, 2)
+  netAmount                 Decimal @db.Decimal(14, 2)
+  taxAmount                 Decimal @default(0) @db.Decimal(14, 2)
+  totalAmount               Decimal @db.Decimal(14, 2)
+
+  lineDiscountBps Int @default(0)
+
+  /// SALINAN harga modal saat penjualan.
+  ///
+  /// PENTING: ini snapshot `products.price_buy` saat itu, BUKAN HPP yang benar.
+  /// HPP presisi butuh `inventory_cost_layers` (FIFO/average) yang masuk Phase 3.
+  /// Disimpan sekarang supaya data historis tidak hilang dan Phase 3 punya
+  /// titik awal untuk rekonsiliasi. Jangan gunakan kolom ini untuk laporan
+  /// laba rugi resmi sebelum cost layer ada.
+  costPriceSnapshot Decimal? @db.Decimal(14, 2)
+
+  createdAt DateTime @default(now())
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  product     Product     @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([transactionId])
+  @@index([productId])
+  // Laporan produk terlaris
+  @@index([productId, createdAt])
+  @@map("transaction_items")
+}
+
+/// Pembayaran per metode. TABEL TERPISAH, bukan enum di `transactions`.
+///
+///asonry Warung nyata menerima pembayaran gabungan: "Rp 50.000 tunai, sisanya
+/// QRIS", atau "DP Rp 20.000, sisanya utang". Satu kolom enum tidak bisa
+/// merepresentasikan itu, dan memaksanya memilih satu berarti satu Silent
+/// kehilangan informasi kas.
+model TransactionPayment {
+  id            String        @id @default(uuid()) @db.Uuid
+  transactionId String        @db.Uuid
+  method        PaymentMethod
+  amount        Decimal       @db.Decimal(14, 2)
+  /// Kode QRIS, nomor transfer, atau id dari payment gateway.
+  reference     String?       @db.VarChar(120)
+  paidAt        DateTime      @default(now())
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@index([transactionId])
+  @@index([method, paidAt])
+  @@map("transaction_payments")
+}
+
+/// Pembayaran utang pelanggan. Satu pembayaran dapat melunasi banyak invoice.
+model DebtPayment {
+  id         String @id @default(uuid()) @db.Uuid
+  customerId String @db.Uuid
+
+  amount Decimal       @db.Decimal(14, 2)
+  method PaymentMethod
+
+  reference    String?  @db.VarChar(120)
+  receivedById String?  @db.Uuid
+  note         String?  @db.VarChar(500)
+  paidAt       DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  /// Transaksi yangegiTransaction pertama yang dilunasi. Nullable: pembayaran
+  /// dapat menutup piutang yang tidak terkait satu transaksi (mis. uang muka).
+  transactionId String? @unique @db.Uuid
+
+  customer    Customer     @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  receivedBy  User?        @relation("DebtReceivedBy", fields: [receivedById], references: [id], onDelete: SetNull)
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  allocations PaymentAllocation[]
+
+  @@index([customerId, paidAt])
+  @@index([paidAt])
+  @@map("debt_payments")
+}
+
+/// Alokasi pembayaran utang ke invoice tertentu (FIFO oldest-first default).
+///
+/// Model many-to-many ini yang hilang di blueprint: satu pembayaran menutup
+/// lima invoice, satu invoice menerima tiga pembayaran. Menyimpan hanya
+/// `debt_payments.transaction_id` memaksa pilihan salah satu di keduanya.
+model PaymentAllocation {
+  id            String   @id @default(uuid()) @db.Uuid
+  paymentId     String   @db.Uuid
+  transactionId String   @db.Uuid
+  amount        Decimal  @db.Decimal(14, 2)
+  createdAt     DateTime @default(now())
+
+  payment     DebtPayment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  @@unique([paymentId, transactionId])
+  @@index([transactionId])
+  @@map("payment_allocations")
+}
+
+/// Penghapusan aset piutang (bad debt write-off).
+///
+/// ARENA menghapus piutang dari pembukuan (= acknowledgeBUG), tabel ini
+/// memisahkannya: piutang jadi tidak tertagih secara operasional, tapi
+/// nilainya tetap tercatat untuk rekap dan untuk remark audit.
+model DebtWriteOff {
+  id             String   @id @default(uuid()) @db.Uuid
+  customerId     String   @db.Uuid
+  amount         Decimal  @db.Decimal(14, 2)
+  reason         String   @db.VarChar(500)
+  /// transaksi yang di-write-off. Kosong = write-off global.
+  transactionIds String[] @default([]) @db.Uuid
+  writtenOffById String?  @db.Uuid
+  createdAt      DateTime @default(now())
+
+  customer     Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  writtenOffBy User?    @relation("WriteOffBy", fields: [writtenOffById], references: [id], onDelete: SetNull)
+
+  @@index([customerId, createdAt])
+  @@map("debt_write_offs")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORDER WHATSAPP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+model Order {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// UNIQUE, dengan format yang sama seperti Invoice.
+  orderNo String @unique @db.VarChar(24)
+
+  /// Pelanggan tetap memakai Customer bila ada; kolom nama/telepon tetap
+  /// disimpan karena pemesan bisa orang yang tidak punya account, dan
+  /// historis pesanan tidak boleh berubah bila pelanggan mengganti nomornya.
+  customerId    String? @db.Uuid
+  customerName  String  @db.VarChar(120)
+  customerPhone String  @db.VarChar(20)
+
+  subtotal      Decimal @db.Decimal(14, 2)
+  discountTotal Decimal @default(0) @db.Decimal(14, 2)
+  total         Decimal @db.Decimal(14, 2)
+
+  status OrderStatus @default(PENDING_WA)
+
+  note      String? @db.VarChar(500)
+  adminNote String? @db.VarChar(500)
+
+  /// Pesan yang sudah di-render, disimpan apa adanya. Kalau format pesan
+  /// berubah di versi berikutnya, isi pesan yang benar-benar terkirim tetap
+  /// bisa diaudit.
+  waMessage String? @db.Text
+  waUrl     String? @db.VarChar(600)
+
+  /// Cara pengiriman: `deep_link` (pelanggan tekan, gratis) atau
+  /// `cloud_api` (server kirim via Business API, berbayar).
+  waChannel    String?   @db.VarChar(20)
+  waSentAt     DateTime?
+  waMessageId  String?   @db.VarChar(120)
+  confirmedAt  DateTime?
+  cancelledAt  DateTime?
+  cancelReason String?   @db.VarChar(300)
+
+  /// Terisi setelah order dikonversi menjadi transaksi POS.
+  transactionId String? @unique @db.Uuid
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  customer    Customer?    @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  transaction Transaction? @relation("OrderTransaction", fields: [transactionId], references: [id], onDelete: SetNull)
+  items       OrderItem[]
+
+  @@index([status, createdAt])
+  @@index([customerPhone])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id        String @id @default(uuid()) @db.Uuid
+  orderId   String @db.Uuid
+  productId String @db.Uuid
+
+  productName String        @db.VarChar(160)
+  sku         String        @db.VarChar(64)
+  unit        UnitOfMeasure
+  qty         Int
+  unitPrice   Decimal       @db.Decimal(14, 2)
+  total       Decimal       @db.Decimal(14, 2)
+
+  /// Stok saat pesanan dibuat. Disimpan untuk menjelaskan kasus "pesanan sudah
+  /// dibuat tapi barang habis sebelum dikonfirmasi".
+  stockAtOrder Int?
+
+  createdAt DateTime @default(now())
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SHIFT KASIR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Sesi kasir. Menyimpan posisi kas awal dan akhir supaya selisih kas harian
+/// bisa dihitung tanpa menebak. Tanpa ini, "kurang Rp 50.000" tidak bisa
+/// dibedakan dari kelalaian kasir dan nucleotide pencurian.
+model Shift {
+  id String @id @default(uuid()) @db.Uuid
+
+  openedById String  @db.Uuid
+  closedById String? @db.Uuid
+
+  status ShiftStatus @default(OPEN)
+
+  /// Uang tunai awal di laci.
+  openingFloat Decimal  @default(0) @db.Decimal(14, 2)
+  /// Uang tunai hasil hitung fisik saat tutup.
+  countedCash  Decimal? @db.Decimal(14, 2)
+  /// openingFloat + penjualan tunai - cash outlay, dihitung server.
+  expectedCash Decimal? @db.Decimal(14, 2)
+  /// countedCash - expectedCash.
+  difference   Decimal? @db.Decimal(14, 2)
+
+  note      String? @db.VarChar(500)
+  closeNote String? @db.VarChar(500)
+
+  openedAt DateTime  @default(now())
+  closedAt DateTime?
+
+  openedBy     User          @relation("ShiftOpenedBy", fields: [openedById], references: [id], onDelete: Restrict)
+  closedBy     User?         @relation("ShiftClosedBy", fields: [closedById], references: [id], onDelete: SetNull)
+  transactions Transaction[]
+
+  /// Hanya satu shift OPEN per pengguna pada satu waktu. Ditegakkan dengan
+  /// partial unique index di SQL migration.
+  @@index([openedById, status])
+  @@index([status])
+  @@map("shifts")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KEAMANAN & OPERASI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Idempotency key untuk POST yang tidak boleh terduplikasi.
+///
+/// Kanal kasir sering kehilangan koneksi di tengah POST. Tanpa tabel ini,
+/// tombol "Ulangi" akan mencatat penjualan dua kali: pelanggan dapat barang
+/// dua kali, stok berkurang dua kali, dan laporan menjadi dua kali amount. Mekanismenya:
+/// saat request datang dengan key yang sudah ada, server mengembalikan respons
+/// yang tersimpan TANPA menjalankan efek lagi.
+///
+/// `requestHash` mendeteksi penyalahgunaan: key yang sama dengan payload
+/// berbeda harus ditolak (409), bukan diam-diam mengembalikan respons lama.
+model IdempotencyKey {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Namespace per jenis operasi, supaya key POS dan key order tidak saling
+  /// tabrakan walau kasir kebetulan memakai string yang sama.
+  scope String @db.VarChar(40)
+
+  key String @db.VarChar(120)
+
+  /// SHA-256 dari body request ternormalisasi.
+  requestHash String @db.VarChar(64)
+
+  /// HTTP status dari respons pertama (201, 200, 422).
+  responseStatus Int
+  /// Body respons pertama, disimpan apa adanya.
+  responseBody   Json
+
+  userId String? @db.Uuid
+
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@unique([scope, key])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
+
+/// Nomor dokumen bebas-tabrak, aman terhadap konkurensi.
+///
+/// `UPDATE ... SET last_value = last_value + 1 ... RETURNING last_value` di
+/// dalam satu statement adalah operasi atomik di Postgres, sehingga dua kasir
+/// yang menekan simpan pada milidetik sama mendapat nomor berbeda. Menyimpan
+/// counter di memory aplikasi (atau memakai `COUNT(*) + 1`) selalu bentrok.
+model DocumentSequence {
+  /// 'INV', 'ORD', atau 'SHF'..code tiga huruf, bukan nama enum.
+  prefix String @db.Char(3)
+  /// 'YYYY-MM' — reset setiap bulan.
+  period String @db.Char(7)
+
+  lastValue Int @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  @@id([prefix, period])
+  @@map("document_sequences")
+}
+
+/// Jejak audit. APPEND-ONLY.
+///
+/// Semua operasi yang mengubah data atau menyentuh uang WAJIB menulis di sini.
+/// Nilai yang dicatat untuk `oldValue` dan `newValue` sudah disanitasi: kolom
+/// seperti passwordHash dan tokenHash TIDAK BOLEH masuk.
+model AuditLog {
+  id String @id @default(uuid()) @db.Uuid
+
+  userId   String?     @db.Uuid
+  action   AuditAction
+  entity   String      @db.VarChar(60)
+  entityId String?     @db.VarChar(60)
+
+  /// Hanya kolom yang berubah, sudah disanitasi.
+  oldValue Json?
+  newValue Json?
+
+  ipAddress String? @db.VarChar(45)
+  userAgent String? @db.VarChar(255)
+
+  /// ID yang menghubungkan beberapa baris audit ke satu request. Penting saat
+  /// satu POST membuat banyak baris (mis. transaksi + item + payment).
+  requestId String? @db.VarChar(64)
+
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([entity, entityId, createdAt])
+  @@index([userId, createdAt])
+  @@index([createdAt])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
+
+/// Pengaturan non-domain milik aplikasi: kunci fitur, cache version, dsb.
+/// Dipisah dari `Setting` agar nilai tweaking teknis tidak tercampur dengan
+/// keputusan bisnis yang butuh jejak audit.
+model AppState {
+  key       String   @id @db.VarChar(64)
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("app_state")
+}
